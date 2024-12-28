@@ -27,7 +27,7 @@ class MODEL(nn.Module):
         i = torch.LongTensor(indices)
         v = torch.FloatTensor(values)
         shape =  uimat.tocoo().shape
-        uimat1=torch.sparse.FloatTensor(i, v, torch.Size(shape))
+        uimat1=torch.sparse_coo_tensor(i, v, torch.Size(shape))
         self.uiadj = uimat1
         self.iuadj = uimat1.transpose(0,1)
         
@@ -78,7 +78,7 @@ class MODEL(nn.Module):
             np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
         values = torch.from_numpy(sparse_mx.data).float()
         shape = torch.Size(sparse_mx.shape)
-        return torch.sparse.FloatTensor(indices, values, shape)
+        return torch.sparse_coo_tensor(indices, values, shape)
     def metaregular(self,em0,em,adj):
         def row_column_shuffle(embedding):
             corrupted_embedding = embedding[:,torch.randperm(embedding.shape[1])]
@@ -214,7 +214,7 @@ class GCN_layer(nn.Module):
             np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
         values = torch.from_numpy(sparse_mx.data).float()
         shape = torch.Size(sparse_mx.shape)
-        return torch.sparse.FloatTensor(indices, values, shape)
+        return torch.sparse_coo_tensor(indices, values, shape)
 
     def normalize_adj(self, adj):
         """Symmetrically normalize adjacency matrix."""
@@ -320,7 +320,7 @@ class HGCL(SequentialModel):
         i = torch.LongTensor(indices)
         v = torch.FloatTensor(values)
         shape = torch.Size([self.userNum, self.itemNum])
-        self.uiadj = torch.sparse.FloatTensor(i, v, shape)
+        self.uiadj = torch.sparse_coo_tensor(i, v, shape)  # Updated from torch.sparse.FloatTensor
         self.iuadj = self.uiadj.transpose(0, 1)
         
         # Gating Weights
@@ -354,19 +354,8 @@ class HGCL(SequentialModel):
         self.mlp1 = MLP(self.hide_dim, self.hide_dim * self.k, self.hide_dim // 2, self.hide_dim * self.k)
         self.mlp2 = MLP(self.hide_dim, self.hide_dim * self.k, self.hide_dim // 2, self.hide_dim * self.k)
         self.mlp3 = MLP(self.hide_dim, self.hide_dim * self.k, self.hide_dim // 2, self.hide_dim * self.k)
-    
-        # Create an instance of the MODEL class
-        self.model = MODEL(
-            args=args, 
-            userNum=self.userNum, 
-            itemNum=self.itemNum, 
-            userMat=userMat, 
-            itemMat=itemMat, 
-            uiMat=uiMat, 
-            hide_dim=self.hide_dim, 
-            Layers=self.LayerNums
-        )
-
+        
+        
     def normalize_adj(self, adj):
         """Symmetrically normalize adjacency matrix."""
         import scipy.sparse as sp
@@ -401,7 +390,7 @@ class HGCL(SequentialModel):
     def self_gatingi(self, em):
         return torch.multiply(em, torch.sigmoid(torch.matmul(em, self.gating_weighti) + self.gating_weightib))
     
-    def metafortransform(self, auxiembedu, targetembedu, auxiembedi, targetembedi):
+    def metafortansform(self, auxiembedu, targetembedu, auxiembedi, targetembedi):
         # Neighbor information
         uneighbor = torch.matmul(self.uiadj, self.ui_itemEmbedding)
         ineighbor = torch.matmul(self.iuadj, self.ui_userEmbedding)
@@ -438,37 +427,63 @@ class HGCL(SequentialModel):
         transfiEmbed = tembedis
         
         return transfuEmbed, transfiEmbed
+
+    def compute_contrastive_loss(self, user_emb, item_emb):
+        """
+        改进的对比损失函数，包含多个对比学习策略
+        """
+        # 1. 归一化嵌入
+        user_emb = F.normalize(user_emb, p=2, dim=1)
+        item_emb = F.normalize(item_emb, p=2, dim=1)
+        
+        # 2. 计算相似度矩阵
+        similarity_matrix = torch.matmul(user_emb, item_emb.t())
+        
+        # 3. 正样本对（对角线）
+        pos_sim = torch.diag(similarity_matrix)
+        
+        # 4. 负样本对
+        neg_sim = similarity_matrix - torch.diag(pos_sim)
+        
+        # 5. 温度系数（控制对比学习的尺度）
+        temperature = 0.1
+        
+        # 6. 对数软max技巧
+        pos_exp = torch.exp(pos_sim / temperature)
+        neg_exp = torch.sum(torch.exp(neg_sim / temperature), dim=1)
+        
+        # 7. InfoNCE损失
+        contrastive_loss = -torch.mean(torch.log(pos_exp / (pos_exp + neg_exp)))
+        
+        # 8. 添加额外的正则化项
+        orthogonal_reg = torch.mean(torch.abs(torch.matmul(user_emb.t(), user_emb) - torch.eye(user_emb.size(1)).to(user_emb.device)))
+        orthogonal_reg += torch.mean(torch.abs(torch.matmul(item_emb.t(), item_emb) - torch.eye(item_emb.size(1)).to(item_emb.device)))
+        
+        # 9. 组合损失
+        total_contrastive_loss = contrastive_loss + 0.1 * orthogonal_reg
+        
+        return total_contrastive_loss
     
     def forward(self, feed_dict):
-        # 提取用户和物品ID
+        # Extract user and item IDs
         users = feed_dict['user_id']
         items = feed_dict['item_id']
         
-        # 如果 items 是二维的，选择第一列
+        # Ensure items are 1-dimensional
         if items.ndim > 1:
             items = items[:, 0]
         
-        # 调用原始模型的 forward 方法
-        userEmbedding, itemEmbedding, _, _, ui_userEmbedding, ui_itemEmbedding, metaregloss = self.model.forward(
-            iftraining=True, 
-            uid=users, 
-            iid=items
-        )
+        # Compute user and item embeddings
+        user_emb = self.embedding_dict['user_emb'](users)
+        item_emb = self.embedding_dict['item_emb'](items)
         
-        # 获取用户和物品嵌入
-        user_emb = userEmbedding
-        item_emb = itemEmbedding
-        
-        # 生成预测
-        # 对于每个用户，计算其与所有物品的分数
-        all_item_emb = self.model.embedding_dict['item_emb'].weight
+        # Generate prediction matrix
+        all_item_emb = self.embedding_dict['item_emb'].weight
         prediction_matrix = torch.matmul(user_emb, all_item_emb.t())
         
-        # 尝试基于历史交互生成标签
+        # Generate labels based on history or default
         if 'history_items' in feed_dict and 'history_times' in feed_dict:
             history_items = feed_dict['history_items']
-            history_times = feed_dict['history_times']
-            
             labels = torch.tensor([
                 len(hist_items) if len(hist_items) > 0 else 0 
                 for hist_items in history_items
@@ -476,64 +491,39 @@ class HGCL(SequentialModel):
         else:
             labels = torch.ones_like(users, dtype=torch.float)
         
+        # Contrastive learning loss preparation
+        contrastive_loss = self.compute_contrastive_loss(user_emb, item_emb)
+        
         return {
             'prediction': prediction_matrix,
             'user_id': users,
             'item_id': items,
             'labels': labels,
-            'metaregloss': metaregloss
+            'contrastive_loss': contrastive_loss
         }
 
     def loss(self, feed_dict):
-        # 获取前向传播的结果
         forward_res = self.forward(feed_dict)
+        
         prediction = forward_res['prediction']
         users = forward_res['user_id']
         items = forward_res['item_id']
         labels = forward_res['labels']
-        metaregloss = forward_res['metaregloss']
         
-        # 选择预测矩阵中每个用户对目标物品的预测分数
+        # 调整损失权重
+        base_weight = 1.0
+        contrastive_weight = 0.5  # 可以根据实验调整
+        
+        # 基础预测损失
         batch_prediction = prediction[torch.arange(prediction.size(0)), items]
-        
-        # 基本的预测损失（均方误差）
         base_loss = F.mse_loss(batch_prediction, labels.float())
         
+        # 重新计算对比损失
+        user_emb = self.embedding_dict['user_emb'](users)
+        item_emb = self.embedding_dict['item_emb'](items)
+        contrastive_loss = self.compute_contrastive_loss(user_emb, item_emb)
+        
         # 总损失
-        meta_reg_weight = 0.1
-        total_loss = base_loss + meta_reg_weight * metaregloss
+        total_loss = base_weight * base_loss + contrastive_weight * contrastive_loss
         
         return total_loss
-
-    def compute_contrastive_loss(self, user_emb, item_emb, temperature=0.5):
-        """
-        计算对比学习损失
-        
-        Args:
-        - user_emb: 用户嵌入 [batch_size, embedding_dim]
-        - item_emb: 物品嵌入 [batch_size, embedding_dim]
-        - temperature: 温度参数，控制对比学习的软硬程度
-        
-        Returns:
-        - contrastive_loss: 对比学习损失
-        """
-        # 计算用户和物品嵌入之间的相似度矩阵
-        # 使用余弦相似度
-        similarity_matrix = F.cosine_similarity(
-            user_emb.unsqueeze(1), 
-            item_emb.unsqueeze(0), 
-            dim=-1
-        ) / temperature
-        
-        # 创建正样本标签（对角线）
-        labels = torch.arange(similarity_matrix.size(0)).to(similarity_matrix.device)
-        
-        # 计算对比损失
-        # 使用交叉熵损失，将相似度矩阵作为输入
-        contrastive_loss = F.cross_entropy(similarity_matrix, labels)
-        
-        return contrastive_loss
-
-
-# small change
-    
